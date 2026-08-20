@@ -43,7 +43,7 @@ NTSTATUS NTAPI ZwQuerySystemInformation(
 #define IOCTL_GDRV_SCAN_HIDDEN_DRIVERS  GDRV_CTL(0x10)
 #define IOCTL_GDRV_CHECK_IOMMU          GDRV_CTL(0x11)
 #define IOCTL_GDRV_CHECK_HYPERVISOR     GDRV_CTL(0x12)
-#define IOCTL_GDRV_WRITE_MSR            GDRV_CTL(0x13)   // <-- NEW
+#define IOCTL_GDRV_GET_MICROCODE        GDRV_CTL(0x13)   // <-- NEW
 
 // -----------------------------------------------------------------
 // Limits
@@ -75,12 +75,6 @@ typedef struct _PATTERN_SCAN_OUTPUT { ULONG64 FoundAddress; } PATTERN_SCAN_OUTPU
 
 typedef struct _READ_MSR_INPUT { ULONG MsrIndex; }   READ_MSR_INPUT, * PREAD_MSR_INPUT;
 typedef struct _READ_MSR_OUTPUT { ULONG64 Value; }     READ_MSR_OUTPUT, * PREAD_MSR_OUTPUT;
-
-// ---- NEW WRITE_MSR ----
-typedef struct _WRITE_MSR_INPUT {
-    ULONG MsrIndex;
-    ULONG64 Value;
-} WRITE_MSR_INPUT, * PWRITE_MSR_INPUT;
 
 typedef struct _PHYS_RANGE_ENTRY { ULONG64 BaseAddress; ULONG64 NumberOfBytes; } PHYS_RANGE_ENTRY;
 typedef struct _PHYS_RANGES_OUTPUT {
@@ -459,11 +453,6 @@ static ULONG64 ScanKernelPattern(ULONG64 base, ULONG size,
 static NTSTATUS ReadMsrSafe(ULONG idx, PULONG64 out) {
     __try { *out = __readmsr(idx); return STATUS_SUCCESS; }
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return STATUS_ILLEGAL_INSTRUCTION; }
-}
-
-static NTSTATUS WriteMsrSafe(ULONG idx, ULONG64 value) {
-    __try { __writemsr(idx, value); return STATUS_SUCCESS; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return STATUS_ILLEGAL_INSTRUCTION; }
 }
 
 static NTSTATUS FillPhysicalRanges(PVOID userBuf, ULONG outLen) {
@@ -1051,6 +1040,10 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
     NTSTATUS s = STATUS_UNSUCCESSFUL;
     ULONG_PTR written = 0;
 
+    // Suppress unused variable warnings (they are used in the switch cases)
+    UNREFERENCED_PARAMETER(inBuf);
+    UNREFERENCED_PARAMETER(inLen);
+
     switch (code) {
     case IOCTL_GDRV_READ_PHYSICAL: {
         if (inLen < sizeof(READ_PHYSICAL_INPUT) || !outBuf) { s = STATUS_BUFFER_TOO_SMALL; break; }
@@ -1110,31 +1103,6 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
         if (NT_SUCCESS(s)) {
             __try { ProbeForWrite(outBuf, sizeof(READ_MSR_OUTPUT), sizeof(UCHAR)); ((PREAD_MSR_OUTPUT)outBuf)->Value = val; written = sizeof(READ_MSR_OUTPUT); }
             __except (EXCEPTION_EXECUTE_HANDLER) { s = GetExceptionCode(); }
-        }
-        break;
-    }
-
-                            // ---- NEW WRITE_MSR ----
-    case IOCTL_GDRV_WRITE_MSR: {
-        if (inLen < sizeof(WRITE_MSR_INPUT)) {
-            s = STATUS_BUFFER_TOO_SMALL;
-            break;
-        }
-        WRITE_MSR_INPUT in;
-        __try {
-            ProbeForRead(inBuf, sizeof(in), __alignof(WRITE_MSR_INPUT));
-            in = *(PWRITE_MSR_INPUT)inBuf;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            s = STATUS_ACCESS_VIOLATION;
-            break;
-        }
-        __try {
-            __writemsr(in.MsrIndex, in.Value);
-            s = STATUS_SUCCESS;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            s = STATUS_ILLEGAL_INSTRUCTION;
         }
         break;
     }
@@ -1212,6 +1180,41 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
         if (!outBuf) { s = STATUS_INVALID_USER_BUFFER; break; }
         s = HandleCheckHypervisor(outBuf, outLen, &written);
         break;
+
+    case IOCTL_GDRV_GET_MICROCODE: {
+        if (outLen < sizeof(READ_MSR_OUTPUT)) {
+            s = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (!outBuf) {
+            s = STATUS_INVALID_USER_BUFFER;
+            break;
+        }
+        READ_MSR_OUTPUT out = { 0 };
+        __try {
+            // Write 0 to MSR 0x8B
+            __writemsr(0x8B, 0);
+            // Execute CPUID leaf 1 to trigger microcode update
+            int cpuInfo[4];
+            __cpuid(cpuInfo, 1);
+            // Read MSR 0x8B
+            out.Value = __readmsr(0x8B);
+            s = STATUS_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            s = STATUS_ILLEGAL_INSTRUCTION;
+            out.Value = 0;
+        }
+        __try {
+            ProbeForWrite(outBuf, sizeof(out), sizeof(UCHAR));
+            RtlCopyMemory(outBuf, &out, sizeof(out));
+            written = sizeof(out);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            s = GetExceptionCode();
+        }
+        break;
+    }
 
     default:
         s = STATUS_INVALID_DEVICE_REQUEST;
