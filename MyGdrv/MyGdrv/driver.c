@@ -43,6 +43,7 @@ NTSTATUS NTAPI ZwQuerySystemInformation(
 #define IOCTL_GDRV_SCAN_HIDDEN_DRIVERS  GDRV_CTL(0x10)
 #define IOCTL_GDRV_CHECK_IOMMU          GDRV_CTL(0x11)
 #define IOCTL_GDRV_CHECK_HYPERVISOR     GDRV_CTL(0x12)
+#define IOCTL_GDRV_WRITE_MSR            GDRV_CTL(0x13)   // <-- NEW
 
 // -----------------------------------------------------------------
 // Limits
@@ -74,6 +75,12 @@ typedef struct _PATTERN_SCAN_OUTPUT { ULONG64 FoundAddress; } PATTERN_SCAN_OUTPU
 
 typedef struct _READ_MSR_INPUT { ULONG MsrIndex; }   READ_MSR_INPUT, * PREAD_MSR_INPUT;
 typedef struct _READ_MSR_OUTPUT { ULONG64 Value; }     READ_MSR_OUTPUT, * PREAD_MSR_OUTPUT;
+
+// ---- NEW WRITE_MSR ----
+typedef struct _WRITE_MSR_INPUT {
+    ULONG MsrIndex;
+    ULONG64 Value;
+} WRITE_MSR_INPUT, * PWRITE_MSR_INPUT;
 
 typedef struct _PHYS_RANGE_ENTRY { ULONG64 BaseAddress; ULONG64 NumberOfBytes; } PHYS_RANGE_ENTRY;
 typedef struct _PHYS_RANGES_OUTPUT {
@@ -454,6 +461,11 @@ static NTSTATUS ReadMsrSafe(ULONG idx, PULONG64 out) {
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return STATUS_ILLEGAL_INSTRUCTION; }
 }
 
+static NTSTATUS WriteMsrSafe(ULONG idx, ULONG64 value) {
+    __try { __writemsr(idx, value); return STATUS_SUCCESS; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return STATUS_ILLEGAL_INSTRUCTION; }
+}
+
 static NTSTATUS FillPhysicalRanges(PVOID userBuf, ULONG outLen) {
     if (outLen < sizeof(PHYS_RANGES_OUTPUT)) return STATUS_BUFFER_TOO_SMALL;
     PPHYSICAL_MEMORY_RANGE sys = MmGetPhysicalMemoryRanges();
@@ -570,11 +582,9 @@ static NTSTATUS HandleScanPciBars(PVOID inBuf, ULONG inLen,
             for (ULONG func = 0; func <= 7; func++) {
                 if (out->DeviceCount >= MAX_PCI_DEVICES) goto scan_done;
 
-                // Quick check: if Vendor ID is 0xFFFF, device doesn't exist
                 if (ReadPciConfigPort((UCHAR)bus, (UCHAR)dev, (UCHAR)func, 0, 2) == 0xFFFF)
                     continue;
 
-                // Read whole config space (256 bytes) into local buffer
                 for (ULONG off = 0; off < 256; off += 4) {
                     ULONG val = ReadPciConfigPort((UCHAR)bus, (UCHAR)dev, (UCHAR)func, (UCHAR)off, 4);
                     RtlCopyMemory(rawCfg + off, &val, 4);
@@ -635,7 +645,7 @@ static NTSTATUS HandleScanPciBars(PVOID inBuf, ULONG inLen,
                         d->SuspicionFlags |= SUSP_64BIT_BAR_ONLY;
                 }
 
-                if (func == 0 && !(cfg->HeaderType & 0x80)) break; // single function
+                if (func == 0 && !(cfg->HeaderType & 0x80)) break;
             }
         }
     }
@@ -1100,6 +1110,31 @@ NTSTATUS DeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
         if (NT_SUCCESS(s)) {
             __try { ProbeForWrite(outBuf, sizeof(READ_MSR_OUTPUT), sizeof(UCHAR)); ((PREAD_MSR_OUTPUT)outBuf)->Value = val; written = sizeof(READ_MSR_OUTPUT); }
             __except (EXCEPTION_EXECUTE_HANDLER) { s = GetExceptionCode(); }
+        }
+        break;
+    }
+
+                            // ---- NEW WRITE_MSR ----
+    case IOCTL_GDRV_WRITE_MSR: {
+        if (inLen < sizeof(WRITE_MSR_INPUT)) {
+            s = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        WRITE_MSR_INPUT in;
+        __try {
+            ProbeForRead(inBuf, sizeof(in), __alignof(WRITE_MSR_INPUT));
+            in = *(PWRITE_MSR_INPUT)inBuf;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            s = STATUS_ACCESS_VIOLATION;
+            break;
+        }
+        __try {
+            __writemsr(in.MsrIndex, in.Value);
+            s = STATUS_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            s = STATUS_ILLEGAL_INSTRUCTION;
         }
         break;
     }
