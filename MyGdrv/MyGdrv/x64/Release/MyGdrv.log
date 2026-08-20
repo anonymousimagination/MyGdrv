@@ -1,0 +1,7 @@
+﻿  Building 'MyGdrv' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  driver.c
+  MyGdrv.vcxproj -> C:\Users\lil timmy fartnuts.GOT-SQUAD\source\repos\MyGdrv\x64\Release\MyGdrv.sys
+  Inf2Cat task was skipped as there were no inf files to process
+  
+  DrvCat task was skipped as there was no catalog file to process
+  
